@@ -87,6 +87,8 @@ class MistakeExample(BaseModel):
     opening_name: Optional[str] = None
     player_color: str
     result: str
+    motif: Optional[str] = None
+    motif_label: Optional[str] = None
 
 
 class TrainingRecommendation(BaseModel):

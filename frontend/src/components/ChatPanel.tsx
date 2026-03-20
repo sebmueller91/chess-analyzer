@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
 import Button from "./ui/Button";
 import Spinner from "./ui/Spinner";
 import { sendChatMessage, clearChat, type ChatMessage } from "@/lib/api";
@@ -150,14 +151,8 @@ export default function ChatPanel({ username, initialMessage }: ChatPanelProps) 
               }`}
             >
               {msg.role === "assistant" ? (
-                <div className="space-y-2">
-                  {msg.content.split("\n").map((line, j) =>
-                    line.trim() ? (
-                      <p key={j}>{line}</p>
-                    ) : (
-                      <br key={j} />
-                    )
-                  )}
+                <div className="prose prose-invert prose-sm max-w-none prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-headings:my-2 prose-strong:text-white prose-code:text-chess-gold prose-code:bg-chess-dark prose-code:px-1 prose-code:rounded">
+                  <ReactMarkdown>{msg.content}</ReactMarkdown>
                 </div>
               ) : (
                 msg.content

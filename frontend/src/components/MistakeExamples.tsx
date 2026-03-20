@@ -1,9 +1,10 @@
 "use client";
 
-import React from "react";
+import React, { useState, useCallback } from "react";
 import Card from "./ui/Card";
 import Badge from "./ui/Badge";
 import Button from "./ui/Button";
+import MoveVisualizer from "./MoveVisualizer";
 import type { MistakeExample } from "@/lib/api";
 
 interface MistakeExamplesProps {
@@ -33,11 +34,28 @@ function classificationColor(c: string): string {
   }
 }
 
+function formatEval(val: number): string {
+  return `${val >= 0 ? "+" : ""}${val.toFixed(1)}`;
+}
+
 export default function MistakeExamples({
   mistakes,
   onExplainMistake,
 }: MistakeExamplesProps) {
   const displayed = mistakes.slice(0, 8);
+  const [expandedCards, setExpandedCards] = useState<Set<number>>(new Set());
+
+  const toggleCard = useCallback((index: number) => {
+    setExpandedCards((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+      return next;
+    });
+  }, []);
 
   if (displayed.length === 0) {
     return (
@@ -49,70 +67,93 @@ export default function MistakeExamples({
 
   return (
     <Card title="Instructive Mistakes" icon={<span>💡</span>}>
-      <div className="space-y-4">
+      <div className="space-y-3">
         {displayed.map((m, i) => {
-          const evalChange = `${m.eval_before >= 0 ? "+" : ""}${m.eval_before.toFixed(1)} → ${m.eval_after >= 0 ? "+" : ""}${m.eval_after.toFixed(1)}`;
+          const expanded = expandedCards.has(i);
+          const evalChange = `${formatEval(m.eval_before)} → ${formatEval(m.eval_after)}`;
+          const showMotif =
+            m.motif_label && m.motif_label !== "Tactical oversight";
 
           return (
             <div
               key={`${m.game_date}-${m.move_number}-${i}`}
-              className="rounded-lg border border-chess-surface-light bg-chess-dark/50 p-4"
+              className="rounded-lg border border-chess-surface-light bg-chess-dark/50 overflow-hidden"
             >
-              <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <Badge variant={classificationVariant(m.classification)}>
-                    {m.classification}
-                  </Badge>
-                  <span className="text-sm text-gray-400">Move {m.move_number}</span>
-                  <Badge variant="neutral">{m.phase}</Badge>
-                </div>
-                <span className="text-xs text-gray-500">
-                  vs {m.game_opponent} • {m.game_date}
-                </span>
-              </div>
-
-              <div className="mb-2 text-sm text-gray-400">
-                {m.opening_name} • Playing as{" "}
-                <span className="capitalize text-gray-200">{m.player_color}</span>
-                {" • "}{m.result}
-              </div>
-
-              <div className="mb-2 grid grid-cols-2 gap-4">
-                <div>
-                  <div className="text-xs text-gray-500">Played</div>
-                  <div className={`font-mono font-medium ${classificationColor(m.classification)}`}>
-                    {m.played_move}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Best move</div>
-                  <div className="font-mono font-medium text-chess-green">
-                    {m.best_move}
-                  </div>
-                </div>
-              </div>
-
-              <div className="mb-3 flex items-center gap-2">
-                <span className="text-xs text-gray-500">Eval:</span>
-                <span className="font-mono text-sm text-chess-accent">
-                  {evalChange}
-                </span>
-              </div>
-
-              <div className="mb-3 rounded border border-chess-surface-light bg-chess-surface p-2">
-                <div className="text-xs text-gray-500">FEN</div>
-                <div className="break-all font-mono text-xs text-gray-400">
-                  {m.fen}
-                </div>
-              </div>
-
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onExplainMistake(m)}
+              {/* Collapsed header — always visible */}
+              <button
+                type="button"
+                onClick={() => toggleCard(i)}
+                className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-chess-surface/40"
               >
-                💬 Explain this mistake
-              </Button>
+                <span className="text-xs text-gray-500 transition-transform duration-200"
+                  style={{ display: "inline-block", transform: expanded ? "rotate(90deg)" : "rotate(0deg)" }}
+                >
+                  ▶
+                </span>
+
+                <Badge variant={classificationVariant(m.classification)}>
+                  {m.classification}
+                </Badge>
+
+                {showMotif && (
+                  <span className="rounded-full border border-purple-500/30 bg-purple-500/10 px-2 py-0.5 text-[10px] font-medium text-purple-300">
+                    {m.motif_label}
+                  </span>
+                )}
+
+                <span className="text-sm text-gray-400">Move {m.move_number}</span>
+
+                <span className="mx-1 hidden text-gray-600 sm:inline">•</span>
+                <span className="hidden text-xs text-gray-500 sm:inline">vs {m.game_opponent}</span>
+
+                <span className="ml-auto flex items-center gap-3 text-xs">
+                  <span className={`font-mono ${classificationColor(m.classification)}`}>
+                    {m.played_move}
+                  </span>
+                  <span className="text-gray-600">→</span>
+                  <span className="font-mono text-chess-green">{m.best_move}</span>
+                  <span className="font-mono text-gray-500">{evalChange}</span>
+                </span>
+              </button>
+
+              {/* Expanded content */}
+              <div
+                className="transition-all duration-200 ease-in-out"
+                style={{
+                  maxHeight: expanded ? "600px" : "0px",
+                  opacity: expanded ? 1 : 0,
+                  overflow: "hidden",
+                }}
+              >
+                <div className="border-t border-chess-surface-light px-4 pb-4 pt-3">
+                  <div className="mb-3 text-sm text-gray-400">
+                    {m.opening_name} • Playing as{" "}
+                    <span className="capitalize text-gray-200">{m.player_color}</span>
+                    {" • "}{m.result} • {m.game_date}
+                  </div>
+
+                  <MoveVisualizer
+                    fen={m.fen}
+                    playedMove={m.played_move}
+                    bestMove={m.best_move}
+                    evalBefore={m.eval_before}
+                    evalAfter={m.eval_after}
+                    playerColor={m.player_color}
+                    classification={m.classification}
+                    motifLabel={m.motif_label}
+                  />
+
+                  <div className="mt-3">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => onExplainMistake(m)}
+                    >
+                      💬 Explain this mistake
+                    </Button>
+                  </div>
+                </div>
+              </div>
             </div>
           );
         })}

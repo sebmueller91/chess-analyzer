@@ -32,6 +32,8 @@ export interface MistakeExample {
   opening_name: string;
   player_color: string;
   result: string;
+  motif?: string;
+  motif_label?: string;
 }
 
 export interface Weakness {
