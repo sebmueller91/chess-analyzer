@@ -2,7 +2,231 @@ import logging
 from collections import defaultdict
 from typing import Any
 
+import chess
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tactical motif detection
+# ---------------------------------------------------------------------------
+
+_PIECE_NAMES = {
+    chess.PAWN: "pawn",
+    chess.KNIGHT: "knight",
+    chess.BISHOP: "bishop",
+    chess.ROOK: "rook",
+    chess.QUEEN: "queen",
+    chess.KING: "king",
+}
+
+_VALUABLE = {chess.QUEEN, chess.ROOK, chess.KNIGHT, chess.BISHOP}
+
+
+def _detect_tactical_motif(fen: str, best_move_san: str, player_color: str) -> str:
+    """Return the primary tactical motif the best move would have exploited.
+
+    Returns a short slug like 'knight_fork', 'hanging_piece', 'back_rank_mate',
+    'check_forcing', 'discovered_attack', 'pin', or 'tactical_oversight'.
+    """
+    if not fen or not best_move_san or best_move_san in ("?", ""):
+        return "tactical_oversight"
+    try:
+        board = chess.Board(fen)
+        color = chess.WHITE if player_color == "white" else chess.BLACK
+        best_move = board.parse_san(best_move_san)
+
+        # --- Hanging piece capture (opponent left a piece undefended) ---
+        if board.is_capture(best_move):
+            victim = board.piece_at(best_move.to_square)
+            if victim:
+                defenders = board.attackers(not color, best_move.to_square)
+                if not defenders:
+                    return "hanging_piece"
+
+        board_after = board.copy()
+        board_after.push(best_move)
+
+        # --- Checkmate ---
+        if board_after.is_checkmate():
+            return "missed_checkmate"
+
+        moved_piece = board.piece_at(best_move.from_square)
+        landing_sq = best_move.to_square
+
+        # --- Fork: piece attacks 2+ valuable targets after the move ---
+        if moved_piece and moved_piece.piece_type != chess.PAWN:
+            attacks = board_after.attacks(landing_sq)
+            attacked_valuable = [
+                sq for sq in attacks
+                if (p := board_after.piece_at(sq))
+                and p.color != color
+                and p.piece_type in _VALUABLE | {chess.KING}
+            ]
+            if len(attacked_valuable) >= 2:
+                piece_name = _PIECE_NAMES.get(moved_piece.piece_type, "piece")
+                return f"{piece_name}_fork"
+
+        # Pawn fork: pawn attacks 2+ pieces diagonally
+        if moved_piece and moved_piece.piece_type == chess.PAWN:
+            attacks = board_after.attacks(landing_sq)
+            attacked_valuable = [
+                sq for sq in attacks
+                if (p := board_after.piece_at(sq))
+                and p.color != color
+                and p.piece_type in _VALUABLE | {chess.KING}
+            ]
+            if len(attacked_valuable) >= 2:
+                return "pawn_fork"
+
+        # --- Check-forcing move (forcing move that was missed) ---
+        if board_after.is_check():
+            return "check_forcing"
+
+        # --- Back-rank mate threat ---
+        opp_king_sq = board_after.king(not color)
+        if opp_king_sq is not None:
+            back_rank = 7 if color == chess.WHITE else 0
+            if chess.square_rank(opp_king_sq) == back_rank:
+                for heavy_type in (chess.ROOK, chess.QUEEN):
+                    for sq in board_after.pieces(heavy_type, color):
+                        if chess.square_rank(sq) == back_rank:
+                            return "back_rank_mate"
+
+        # --- Discovered attack: moving piece reveals an attacker behind it ---
+        from_sq = best_move.from_square
+        attackers_before = set(board.attackers(color, from_sq))
+        attackers_after_sq = set()
+        for sq in chess.SQUARES:
+            p = board_after.piece_at(sq)
+            if p and p.color == color and sq != landing_sq:
+                if len(board_after.attacks(sq) & board_after.pieces(chess.QUEEN, not color)) > 0:
+                    continue
+                if board_after.is_attacked_by(color, sq):
+                    continue
+        # Simpler discovered check/attack heuristic: a piece on the landing rank/file
+        # now attacks a valuable piece it couldn't before because the moved piece was blocking
+        if moved_piece:
+            for sq in board.pieces(chess.ROOK, color) | board.pieces(chess.BISHOP, color) | board.pieces(chess.QUEEN, color):
+                if sq == from_sq:
+                    continue
+                targets_before = {
+                    s for s in board.attacks(sq)
+                    if (p := board.piece_at(s)) and p.color != color and p.piece_type in _VALUABLE | {chess.KING}
+                }
+                targets_after = {
+                    s for s in board_after.attacks(sq)
+                    if (p := board_after.piece_at(s)) and p.color != color and p.piece_type in _VALUABLE | {chess.KING}
+                }
+                if targets_after - targets_before:
+                    return "discovered_attack"
+
+        # --- Pin: after the move a valuable opponent piece is pinned to the king ---
+        opp_king = board_after.king(not color)
+        if opp_king is not None:
+            for sq in chess.SQUARES:
+                p = board_after.piece_at(sq)
+                if p and p.color == color and p.piece_type in (chess.BISHOP, chess.ROOK, chess.QUEEN):
+                    if board_after.is_pinned(not color, sq):
+                        pinned = board_after.piece_at(sq)
+                        if pinned and pinned.piece_type in _VALUABLE:
+                            return "pin"
+
+    except Exception:
+        pass
+    return "tactical_oversight"
+
+
+_MOTIF_DISPLAY: dict[str, str] = {
+    "knight_fork": "Missed knight fork",
+    "bishop_fork": "Missed bishop fork",
+    "rook_fork": "Missed rook fork",
+    "queen_fork": "Missed queen fork",
+    "pawn_fork": "Missed pawn fork",
+    "hanging_piece": "Left piece hanging / missed free material",
+    "missed_checkmate": "Missed checkmate",
+    "back_rank_mate": "Back-rank vulnerability",
+    "check_forcing": "Missed forcing check",
+    "discovered_attack": "Missed discovered attack",
+    "pin": "Missed pin",
+    "tactical_oversight": "Tactical oversight",
+}
+
+_MOTIF_ADVICE: dict[str, str] = {
+    "knight_fork": (
+        "Practice knight fork puzzles on Lichess.org/training (search 'fork' theme). "
+        "Before each move, visualize where your knight could jump to attack two pieces simultaneously."
+    ),
+    "bishop_fork": (
+        "Practice bishop fork puzzles. Train yourself to spot long diagonal attacks that threaten "
+        "two pieces at once."
+    ),
+    "rook_fork": (
+        "Practice rook skewer and fork patterns. Rook forks often arise when pieces are on the same rank or file."
+    ),
+    "queen_fork": (
+        "Practice queen fork and double-attack puzzles. "
+        "After each opponent move, check if your queen can attack two undefended targets."
+    ),
+    "pawn_fork": (
+        "Practice pawn fork puzzles. Pawn advances that attack two pieces diagonally are common "
+        "and easy to miss — scan for them before playing a pawn push."
+    ),
+    "hanging_piece": (
+        "Before every move, do a quick 'hang-check': look at all opponent pieces and ask "
+        "'is this piece defended?' Capturing undefended pieces is always the first priority. "
+        "Practice 'hanging piece' puzzles on Lichess."
+    ),
+    "missed_checkmate": (
+        "Practice mate-in-1, mate-in-2, and mate-in-3 puzzles daily. "
+        "Always check for checkmate before playing any other move."
+    ),
+    "back_rank_mate": (
+        "Practice back-rank mate puzzles on Lichess. "
+        "In your own games, always ensure your king has a luft (escape square) by moving a pawn. "
+        "Check for back-rank weaknesses before making rook moves."
+    ),
+    "check_forcing": (
+        "Practice forcing-sequence puzzles — checks, captures, threats. "
+        "Develop a habit of always asking 'what checks, captures, or threats are available?' before each move."
+    ),
+    "discovered_attack": (
+        "Practice discovered attack and discovered check puzzles on Lichess. "
+        "Look for pieces that are 'hiding behind' another piece along a rank, file, or diagonal."
+    ),
+    "pin": (
+        "Practice pin and skewer puzzles. Look for opportunities to place bishops, rooks, "
+        "or queens on diagonals/files that pin opponent pieces to their king or queen."
+    ),
+    "tactical_oversight": (
+        "Solve tactical puzzles daily covering all themes: forks, pins, back-rank, discovered attacks. "
+        "Use Lichess.org/training for free themed puzzles."
+    ),
+}
+
+
+def _format_motif_example(m: dict) -> str:
+    """Build a short human-readable example string from a mistake dict."""
+    move = m.get("move_number", "?")
+    opp = m.get("game_opponent", "?")
+    played = m.get("played_move", "?")
+    best = m.get("best_move", "?")
+    drop = m.get("eval_drop", 0)
+    phase = m.get("phase", "")
+    date = str(m.get("game_date", ""))[:10]
+    color = m.get("player_color", "")
+    result = m.get("result", "")
+    drop_pawns = round(drop / 100, 1) if drop else "?"
+    parts = [f"move {move} vs {opp}"]
+    if date and date != "None":
+        parts.append(f"({date})")
+    if color:
+        parts.append(f"as {color}")
+    if phase:
+        parts.append(f"[{phase}]")
+    parts.append(f"— played {played}, best was {best} ({drop_pawns} pawn loss)")
+    if result:
+        parts.append(f"[{result}]")
+    return " ".join(parts)
 
 
 def generate_report(
@@ -92,145 +316,199 @@ def generate_report(
 def _identify_weaknesses(
     all_mistakes: list[dict], analysis_results: list[dict]
 ) -> list[dict[str, Any]]:
-    """Identify top 3-5 weaknesses from mistake patterns."""
-    phase_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    phase_examples: dict[str, list[dict]] = defaultdict(list)
+    """Identify top 5 weaknesses, grouped by specific tactical motif and pattern."""
+    # --- Step 1: Detect motif for each blunder/mistake (skip inaccuracies for motif grouping) ---
+    motif_mistakes: dict[str, list[dict]] = defaultdict(list)
+    phase_mistakes: dict[str, list[dict]] = defaultdict(list)
 
     for m in all_mistakes:
         phase = m.get("phase", "middlegame")
         classification = m.get("classification", "inaccuracy")
-        phase_counts[phase][classification] += 1
-        phase_examples[phase].append(m)
+        phase_mistakes[phase].append(m)
+
+        # Only run motif detection on blunders and mistakes (significant errors)
+        if classification in ("blunder", "mistake"):
+            motif = _detect_tactical_motif(
+                m.get("fen", ""),
+                m.get("best_move", ""),
+                m.get("player_color", "white"),
+            )
+            m["_motif"] = motif
+            motif_mistakes[motif].append(m)
+        else:
+            m["_motif"] = "inaccuracy"
 
     weaknesses: list[dict[str, Any]] = []
 
-    # Middlegame tactical issues
-    mg = phase_counts.get("middlegame", {})
-    mg_total = sum(mg.values())
-    if mg_total >= 2:
-        mg_blunders = mg.get("blunder", 0) + mg.get("mistake", 0)
-        severity = "high" if mg_blunders > mg_total * 0.3 else "medium"
+    # --- Step 2: Motif-based weaknesses (most specific) ---
+    # Sort motifs by frequency, excluding the generic fallback first
+    motif_counts = {k: len(v) for k, v in motif_mistakes.items()}
+    sorted_motifs = sorted(motif_counts.items(), key=lambda x: x[1], reverse=True)
+
+    for motif, count in sorted_motifs:
+        if count < 2:
+            continue
         examples = sorted(
-            phase_examples.get("middlegame", []),
+            motif_mistakes[motif],
             key=lambda x: x.get("eval_drop", 0),
             reverse=True,
-        )[:3]
+        )[:4]
+
+        display_name = _MOTIF_DISPLAY.get(motif, "Tactical oversight")
+        blunder_count = sum(1 for e in motif_mistakes[motif] if e.get("classification") == "blunder")
+        mistake_count = sum(1 for e in motif_mistakes[motif] if e.get("classification") == "mistake")
+        severity = "high" if blunder_count >= 2 else ("medium" if count >= 3 else "low")
+
+        # Build specific description referencing actual games
+        example_refs = [_format_motif_example(e) for e in examples[:3]]
+        example_text = "; ".join(example_refs)
+
+        if motif == "hanging_piece":
+            description = (
+                f"You missed free material {count} time{'s' if count > 1 else ''} "
+                f"({blunder_count} blunder{'s' if blunder_count != 1 else ''}, "
+                f"{mistake_count} mistake{'s' if mistake_count != 1 else ''}). "
+                f"Examples: {example_text}."
+            )
+        elif motif == "missed_checkmate":
+            description = (
+                f"You missed checkmate {count} time{'s' if count > 1 else ''} — "
+                f"always scan for mate before other moves. "
+                f"Examples: {example_text}."
+            )
+        elif motif == "back_rank_mate":
+            description = (
+                f"You missed {count} back-rank threats. "
+                f"Ensure your king always has an escape square (luft). "
+                f"Examples: {example_text}."
+            )
+        elif "_fork" in motif:
+            piece = motif.replace("_fork", "")
+            description = (
+                f"You missed {piece} fork{'s' if count > 1 else ''} {count} time{'s' if count > 1 else ''}. "
+                f"After every {piece} move, ask: 'Can I attack two pieces at once?' "
+                f"Examples: {example_text}."
+            )
+        elif motif == "discovered_attack":
+            description = (
+                f"You missed {count} discovered attack opportunity{'ies' if count > 1 else 'y'}. "
+                f"Look for pieces hiding behind others along ranks, files, and diagonals. "
+                f"Examples: {example_text}."
+            )
+        elif motif == "pin":
+            description = (
+                f"You missed {count} pin opportunity{'ies' if count > 1 else 'y'}. "
+                f"Scan for bishop/rook/queen moves that restrict opponent's most valuable piece. "
+                f"Examples: {example_text}."
+            )
+        elif motif == "check_forcing":
+            description = (
+                f"You missed {count} forcing check{'s' if count > 1 else ''} that would have "
+                f"won material or improved your position. "
+                f"Always ask 'What checks are available?' before each move. "
+                f"Examples: {example_text}."
+            )
+        else:
+            description = (
+                f"You had {count} tactical oversights across analyzed games "
+                f"({blunder_count} blunders, {mistake_count} mistakes). "
+                f"Examples: {example_text}."
+            )
+
         weaknesses.append({
-            "name": "Tactical oversights in middlegame",
-            "description": (
-                f"You made {mg_total} errors in the middlegame phase across analyzed games, "
-                f"including {mg.get('blunder', 0)} blunders and {mg.get('mistake', 0)} mistakes."
-            ),
-            "frequency": mg_total,
+            "name": display_name,
+            "motif": motif,
+            "description": description,
+            "frequency": count,
             "severity": severity,
-            "phase": "middlegame",
+            "phase": "all",
             "examples": [
-                {"opponent": e.get("game_opponent"), "move": e.get("move_number")}
-                for e in examples
+                {
+                    "opponent": e.get("game_opponent"),
+                    "move": e.get("move_number"),
+                    "played": e.get("played_move"),
+                    "best": e.get("best_move"),
+                    "eval_drop": e.get("eval_drop"),
+                    "phase": e.get("phase"),
+                }
+                for e in examples[:3]
+            ],
+        })
+
+    # --- Step 3: Phase-based weaknesses (as additional context if motif list < 3) ---
+    # Opening-specific: flag specific openings with high error rates
+    opening_mistakes = phase_mistakes.get("opening", [])
+    if len(opening_mistakes) >= 2 and len(weaknesses) < 5:
+        op_blunders = sum(1 for m in opening_mistakes if m.get("classification") in ("blunder", "mistake"))
+        severity = "high" if op_blunders >= 3 else "medium"
+        examples = sorted(opening_mistakes, key=lambda x: x.get("eval_drop", 0), reverse=True)[:3]
+        # Group by opening name
+        op_names: dict[str, int] = defaultdict(int)
+        for m in opening_mistakes:
+            op_name = m.get("opening_name") or "unknown opening"
+            op_names[op_name] += 1
+        top_op = sorted(op_names.items(), key=lambda x: x[1], reverse=True)[:2]
+        op_name_str = " and ".join(f"{n} ({c}x)" for n, c in top_op)
+        example_refs = [_format_motif_example(e) for e in examples[:2]]
+
+        weaknesses.append({
+            "name": "Opening preparation gaps",
+            "motif": "opening_errors",
+            "description": (
+                f"You made {len(opening_mistakes)} errors in the opening phase "
+                f"(moves 1-10), most frequently in: {op_name_str}. "
+                f"Examples: {'; '.join(example_refs)}."
+            ),
+            "frequency": len(opening_mistakes),
+            "severity": severity,
+            "phase": "opening",
+            "examples": [
+                {
+                    "opponent": e.get("game_opponent"),
+                    "move": e.get("move_number"),
+                    "played": e.get("played_move"),
+                    "best": e.get("best_move"),
+                    "eval_drop": e.get("eval_drop"),
+                    "phase": "opening",
+                }
+                for e in examples[:3]
             ],
         })
 
     # Endgame technique
-    eg = phase_counts.get("endgame", {})
-    eg_total = sum(eg.values())
-    if eg_total >= 2:
-        severity = "high" if eg.get("blunder", 0) >= 2 else "medium"
-        examples = sorted(
-            phase_examples.get("endgame", []),
-            key=lambda x: x.get("eval_drop", 0),
-            reverse=True,
-        )[:3]
+    endgame_mistakes = phase_mistakes.get("endgame", [])
+    if len(endgame_mistakes) >= 2 and len(weaknesses) < 5:
+        eg_blunders = sum(1 for m in endgame_mistakes if m.get("classification") == "blunder")
+        severity = "high" if eg_blunders >= 2 else "medium"
+        examples = sorted(endgame_mistakes, key=lambda x: x.get("eval_drop", 0), reverse=True)[:3]
+        example_refs = [_format_motif_example(e) for e in examples[:2]]
+
         weaknesses.append({
             "name": "Endgame technique",
+            "motif": "endgame_errors",
             "description": (
-                f"You made {eg_total} errors in endgames, "
-                f"including {eg.get('blunder', 0)} blunders. Endgame precision is critical."
+                f"You made {len(endgame_mistakes)} errors in endgame positions "
+                f"({eg_blunders} blunders). "
+                f"Examples: {'; '.join(example_refs)}."
             ),
-            "frequency": eg_total,
+            "frequency": len(endgame_mistakes),
             "severity": severity,
             "phase": "endgame",
             "examples": [
-                {"opponent": e.get("game_opponent"), "move": e.get("move_number")}
-                for e in examples
+                {
+                    "opponent": e.get("game_opponent"),
+                    "move": e.get("move_number"),
+                    "played": e.get("played_move"),
+                    "best": e.get("best_move"),
+                    "eval_drop": e.get("eval_drop"),
+                    "phase": "endgame",
+                }
+                for e in examples[:3]
             ],
         })
 
-    # Opening preparation
-    op = phase_counts.get("opening", {})
-    op_total = sum(op.values())
-    if op_total >= 2:
-        severity = "medium" if op_total >= 5 else "low"
-        examples = sorted(
-            phase_examples.get("opening", []),
-            key=lambda x: x.get("eval_drop", 0),
-            reverse=True,
-        )[:3]
-        weaknesses.append({
-            "name": "Opening preparation",
-            "description": (
-                f"You made {op_total} errors in the opening phase. "
-                f"Better preparation could avoid early disadvantages."
-            ),
-            "frequency": op_total,
-            "severity": severity,
-            "phase": "opening",
-            "examples": [
-                {"opponent": e.get("game_opponent"), "move": e.get("move_number")}
-                for e in examples
-            ],
-        })
-
-    # Piece activity — blunders across all phases suggest piece coordination issues
-    total_blunders = sum(
-        1 for m in all_mistakes if m.get("classification") == "blunder"
-    )
-    if total_blunders >= 3:
-        big_blunders = sorted(
-            [m for m in all_mistakes if m.get("classification") == "blunder"],
-            key=lambda x: x.get("eval_drop", 0),
-            reverse=True,
-        )[:3]
-        weaknesses.append({
-            "name": "Piece activity",
-            "description": (
-                f"You had {total_blunders} blunders across all phases, suggesting issues "
-                f"with keeping pieces active and coordinated."
-            ),
-            "frequency": total_blunders,
-            "severity": "high",
-            "phase": "all",
-            "examples": [
-                {"opponent": e.get("game_opponent"), "move": e.get("move_number")}
-                for e in big_blunders
-            ],
-        })
-
-    # Late-game mistakes (time pressure proxy — mistakes after move 30)
-    late_mistakes = [m for m in all_mistakes if m.get("move_number", 0) > 30]
-    if len(late_mistakes) >= 3:
-        severity = "high" if len(late_mistakes) >= 5 else "medium"
-        examples = sorted(
-            late_mistakes,
-            key=lambda x: x.get("eval_drop", 0),
-            reverse=True,
-        )[:3]
-        weaknesses.append({
-            "name": "Time pressure",
-            "description": (
-                f"You made {len(late_mistakes)} errors after move 30, which may indicate "
-                f"time management issues in longer games."
-            ),
-            "frequency": len(late_mistakes),
-            "severity": severity,
-            "phase": "endgame",
-            "examples": [
-                {"opponent": e.get("game_opponent"), "move": e.get("move_number")}
-                for e in examples
-            ],
-        })
-
-    # Sort by frequency descending and take top 5
-    weaknesses.sort(key=lambda w: w["frequency"], reverse=True)
+    # Sort by frequency descending and return top 5
+    weaknesses.sort(key=lambda w: (w["frequency"], w["severity"] == "high"), reverse=True)
     return weaknesses[:5]
 
 
@@ -405,13 +683,13 @@ def _color_comparison(
 
 
 def _select_mistake_examples(all_mistakes: list[dict]) -> list[dict[str, Any]]:
-    """Select 5-8 most instructive mistake examples."""
+    """Select 5-8 most instructive mistake examples, annotated with detected motif."""
     # Sort by eval_drop descending for most dramatic
     sorted_mistakes = sorted(
         all_mistakes, key=lambda m: m.get("eval_drop", 0), reverse=True
     )
 
-    # Pick diverse phases
+    # Pick diverse phases and motifs
     selected: list[dict[str, Any]] = []
     phases_seen: dict[str, int] = defaultdict(int)
 
@@ -423,6 +701,12 @@ def _select_mistake_examples(all_mistakes: list[dict]) -> list[dict[str, Any]]:
         if phases_seen[phase] >= 3:
             continue
         phases_seen[phase] += 1
+
+        motif = m.get("_motif") or _detect_tactical_motif(
+            m.get("fen", ""),
+            m.get("best_move", ""),
+            m.get("player_color", "white"),
+        )
 
         selected.append({
             "game_opponent": m.get("game_opponent", "?"),
@@ -438,6 +722,8 @@ def _select_mistake_examples(all_mistakes: list[dict]) -> list[dict[str, Any]]:
             "opening_name": m.get("opening_name"),
             "player_color": m.get("player_color", ""),
             "result": m.get("result", ""),
+            "motif": motif,
+            "motif_label": _MOTIF_DISPLAY.get(motif, "Tactical oversight"),
         })
 
     return selected
@@ -449,79 +735,93 @@ def _generate_recommendations(
     color_comparison: dict[str, dict],
     summary: dict,
 ) -> list[dict[str, Any]]:
-    """Generate training recommendations based on identified weaknesses."""
+    """Generate specific training recommendations based on detected tactical motifs."""
     recommendations: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
 
-    for w in weaknesses[:3]:
-        name = w["name"]
-        if "middlegame" in name.lower() or "tactical" in name.lower():
-            recommendations.append({
-                "title": "Practice tactical puzzles",
-                "description": (
-                    f"You had {w['frequency']} tactical errors in the middlegame. "
-                    "Solve 10-15 tactical puzzles daily on Chess.com or Lichess, "
-                    "focusing on patterns like pins, forks, and discovered attacks."
-                ),
-                "priority": "high" if w["severity"] == "high" else "medium",
-                "related_weakness": name,
-            })
-        elif "endgame" in name.lower():
-            recommendations.append({
-                "title": "Study endgame fundamentals",
-                "description": (
-                    f"You made {w['frequency']} endgame errors. Focus on basic rook endgames, "
-                    "king activity, and pawn promotion technique. "
-                    "Silman's Complete Endgame Course is an excellent resource."
-                ),
-                "priority": "high" if w["severity"] == "high" else "medium",
-                "related_weakness": name,
-            })
-        elif "opening" in name.lower():
-            recommendations.append({
-                "title": "Build an opening repertoire",
-                "description": (
-                    f"You had {w['frequency']} opening errors. Choose 1-2 openings for each color "
-                    "and study the key ideas and typical plans rather than memorizing long lines."
-                ),
-                "priority": "medium",
-                "related_weakness": name,
-            })
-        elif "piece" in name.lower():
-            recommendations.append({
-                "title": "Improve piece coordination",
-                "description": (
-                    f"You had {w['frequency']} blunders suggesting piece activity issues. "
-                    "Before each move, check all opponent threats and ensure your pieces "
-                    "are actively placed. A simple blunder check can save many games."
-                ),
-                "priority": "high",
-                "related_weakness": name,
-            })
-        elif "time" in name.lower():
-            recommendations.append({
-                "title": "Improve time management",
-                "description": (
-                    f"You made {w['frequency']} errors in later moves, likely due to time pressure. "
-                    "Practice with increment time controls and develop a habit of "
-                    "checking the clock after every 5 moves."
-                ),
-                "priority": "medium",
-                "related_weakness": name,
-            })
+    for w in weaknesses[:4]:
+        motif = w.get("motif", "")
+        name = w.get("name", "")
+        freq = w.get("frequency", 0)
+        severity = w.get("severity", "medium")
+        priority = "high" if severity == "high" else "medium"
 
-    # Add a general recommendation if we have fewer than 3
-    if len(recommendations) < 3:
-        if summary.get("avg_accuracy", 100) < 75:
-            recommendations.append({
-                "title": "Analyze your games regularly",
-                "description": (
-                    f"Your average accuracy is {summary.get('avg_accuracy', 0)}%. "
-                    "Review each game after playing, identify where you went wrong, "
-                    "and try to understand the correct ideas."
-                ),
-                "priority": "high",
-                "related_weakness": "General improvement",
-            })
+        if motif in _MOTIF_ADVICE:
+            advice = _MOTIF_ADVICE[motif]
+            display = _MOTIF_DISPLAY.get(motif, name)
+
+            if motif == "hanging_piece":
+                title = "Train hanging-piece awareness"
+                description = (
+                    f"You missed free material {freq} times in analyzed games. "
+                    f"{advice}"
+                )
+            elif motif == "missed_checkmate":
+                title = "Daily mate-finding practice"
+                description = (
+                    f"You missed checkmate {freq} time{'s' if freq > 1 else ''} — "
+                    f"this is critical. {advice}"
+                )
+            elif motif == "back_rank_mate":
+                title = "Eliminate back-rank vulnerabilities"
+                description = (
+                    f"You missed {freq} back-rank opportunities and may have been "
+                    f"vulnerable to them yourself. {advice}"
+                )
+            elif "_fork" in motif:
+                piece = motif.replace("_fork", "")
+                title = f"Practice {piece} fork puzzles"
+                description = (
+                    f"You missed {piece} forks {freq} time{'s' if freq > 1 else ''}. "
+                    f"{advice}"
+                )
+            elif motif == "discovered_attack":
+                title = "Train discovered attack patterns"
+                description = (
+                    f"You missed {freq} discovered attack{'s' if freq > 1 else ''}. "
+                    f"{advice}"
+                )
+            elif motif == "pin":
+                title = "Practice pin and skewer puzzles"
+                description = (
+                    f"You missed {freq} pin opportunity{'ies' if freq > 1 else 'y'}. "
+                    f"{advice}"
+                )
+            elif motif == "check_forcing":
+                title = "Train forcing sequences (checks & captures)"
+                description = (
+                    f"You missed {freq} forcing check{'s' if freq > 1 else ''} that "
+                    f"would have changed the outcome. {advice}"
+                )
+            elif motif == "opening_errors":
+                title = "Fix your opening preparation"
+                description = (
+                    f"You made {freq} errors in the first 10 moves. "
+                    "Study the key ideas of your chosen openings rather than memorizing long lines. "
+                    "Focus especially on piece development, king safety, and central control."
+                )
+                priority = "medium"
+            elif motif == "endgame_errors":
+                title = "Study endgame fundamentals"
+                description = (
+                    f"You made {freq} endgame errors. "
+                    "Focus on king activity, pawn promotion technique, and basic rook endgames. "
+                    "Lichess.org/practice has free endgame training."
+                )
+            else:
+                title = "Daily tactical training"
+                description = (
+                    f"You had {freq} tactical oversights. {advice}"
+                )
+
+            if title not in seen_titles:
+                seen_titles.add(title)
+                recommendations.append({
+                    "title": title,
+                    "description": description,
+                    "priority": priority,
+                    "related_weakness": name,
+                })
 
     # Color-specific recommendation
     white_data = color_comparison.get("white", {})
@@ -530,16 +830,33 @@ def _generate_recommendations(
     b_wr = black_data.get("win_rate", 50)
     if abs(w_wr - b_wr) > 15 and len(recommendations) < 5:
         weaker = "black" if b_wr < w_wr else "white"
+        title = f"Strengthen your {weaker} repertoire"
+        if title not in seen_titles:
+            seen_titles.add(title)
+            recommendations.append({
+                "title": title,
+                "description": (
+                    f"Your win rate as {weaker} is {min(w_wr, b_wr):.1f}% vs "
+                    f"{max(w_wr, b_wr):.1f}% as {'white' if weaker == 'black' else 'black'}. "
+                    f"This gap ({abs(w_wr - b_wr):.1f}%) suggests a specific problem with your "
+                    f"{weaker} openings. Review the worst-performing openings in your stats and "
+                    "consider replacing or studying them deeply."
+                ),
+                "priority": "medium",
+                "related_weakness": f"{weaker.capitalize()} performance",
+            })
+
+    # Fallback general recommendation
+    if len(recommendations) < 2:
         recommendations.append({
-            "title": f"Improve your {weaker} repertoire",
+            "title": "Analyze your games regularly",
             "description": (
-                f"Your win rate as {weaker} ({min(w_wr, b_wr):.1f}%) is significantly "
-                f"lower than as {'white' if weaker == 'black' else 'black'} "
-                f"({max(w_wr, b_wr):.1f}%). Focus on building confidence "
-                f"with your {weaker} openings."
+                f"Your average accuracy is {summary.get('avg_accuracy', 0)}%. "
+                "Review each game after playing, identify the key turning point, "
+                "and try to understand the best continuation."
             ),
-            "priority": "medium",
-            "related_weakness": f"{weaker.capitalize()} performance",
+            "priority": "high" if summary.get("avg_accuracy", 100) < 70 else "medium",
+            "related_weakness": "General improvement",
         })
 
     return recommendations[:5]
